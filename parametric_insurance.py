@@ -1,3 +1,4 @@
+# v0.3.0-rc7
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 """
 ParametricInsurance
@@ -12,13 +13,17 @@ single point of failure.
 
 Why this is more than "AI decides X"
 -------------------------------------
-1. Real money flow with deterministic lifecycle. A product defines a
-   `premium` and a `coverage` amount. Policies are bought with a payable
-   call (`buy_policy`) that *requires the exact premium*; claims that are
-   approved pay out the coverage via `emit_transfer` straight to the
-   holder. The pool is funded by the insurer (`fund_pool`) and can only be
-   withdrawn from by the product creator (`withdraw_funds`). No LLM
-   decides how much money moves -- the amount is fixed per policy.
+ 1. Real money flow with deterministic lifecycle. A product defines a
+    `premium` and a `coverage` amount. Policies are bought with a payable
+    call (`buy_policy`) that *requires the exact premium*; claims that are
+    approved pay out the coverage via `emit_transfer` straight to the
+    holder. Every product has its *own* pool ledger (`pool_balance`):
+    premiums and `fund_pool` credits go to a specific product's pool, and
+    only that product's creator may `withdraw_funds` from it -- so no
+    creator can ever touch funds backing another product's policies. When
+    a claim is approved the coverage is *reserved* (deducted) from the
+    product's ledger at decision time, before the transfer settles. No LLM
+    decides how much money moves -- the amount is fixed per policy.
 2. Multi-source oracle consensus, restructured to be lint-clean and
    threshold-safe. The non-deterministic block is deliberately minimal:
    the leader and every validator only *acquire* evidence
@@ -39,11 +44,13 @@ Why this is more than "AI decides X"
    comparisons. There is no `float()` anywhere in the contract -- GenVM
    lint treats floats as non-deterministic, so the whole pipeline (LLM value
    parse, median, tolerance band, threshold crossing, payout) is integer math.
-4. Defense against fraud / abuse. Only the holder of a policy can file a
-   claim on it; a policy can only be claimed once; claims can't be filed
-   against a suspended product; a claim is rejected (not paid) when the
-   sources can't reach consensus or when fewer than `MIN_DATA_SOURCES`
-   sources were reachable; the payout is guarded by the pool balance.
+ 4. Defense against fraud / abuse. Only the holder of a policy can file a
+    claim on it; a policy can only be claimed once; claims can't be filed
+    against a suspended product; a claim is rejected (not paid) when the
+    sources can't reach consensus or when fewer than `MIN_DATA_SOURCES`
+    sources were reachable; the payout is reserved from the product's own
+    pool balance, so a creator can never drain funds earmarked for another
+    product's payouts.
 5. Deterministic, unit-testable helpers. `_median`, `_parse_number`,
    `_tolerance_band`, `_within_tolerance`, `_extract_parameter` are plain
    integer-only Python that run before/after the consensus block and can
@@ -55,11 +62,16 @@ Trust model / limitations
   contract verifies agreement *between* sources, not the truth of the
   sources themselves. A product whose sources all feed the same upstream
   is a single point of failure.
-- The contract does not check *who* the physical claimant is; any holder
-  of the policy NFT-equivalent (address) can collect. On GenLayer a native
-  transfer to the holder is the payout mechanism.
-- The pool must be funded before covered claims are filed; a covered claim
-  reverts with a clear message when `self.balance < coverage`.
+- Balances are isolated *per product*, not per contract: each product has
+  its own `pool_balance` ledger and only its creator can withdraw from it.
+  Anyone may fund any product's pool, and any holder of a policy collects
+  its payout from that product's pool. Funds sent to the contract outside
+  a product-creating/funding path are not attributed to any pool.
+- A product's pool must be funded before its covered claims are filed; a
+  covered claim reverts with a clear message when the product's
+  `pool_balance < coverage`. Approved claims reserve the coverage in the
+  product's ledger at decision time (before the transfer settles), so a
+  creator cannot withdraw money already earmarked for a pending payout.
 """
 
 from genlayer import *
@@ -122,6 +134,7 @@ class Product:
     data_sources: DynArray[str]
     status: str
     created_by: Address
+    pool_balance: u256       # this product's own pool ledger, in native tokens
 
     def as_dict(self) -> dict:
         return {
@@ -134,6 +147,7 @@ class Product:
             "data_sources": [u for u in self.data_sources],
             "status": self.status,
             "created_by": str(self.created_by),
+            "pool_balance": int(self.pool_balance),
         }
 
 
@@ -353,6 +367,7 @@ class ParametricInsurance(gl.Contract):
             data_sources=sources,
             status=PRODUCT_STATUS_ACTIVE,
             created_by=gl.message.sender_address,
+            pool_balance=u256(0),
         )
         return product_id
 
@@ -370,33 +385,45 @@ class ParametricInsurance(gl.Contract):
         self.products[product_id] = product
 
     @gl.public.write.payable
-    def fund_pool(self) -> None:
-        """Anyone may add liquidity to the payout pool. The received value
-        is simply kept on the contract; no balance is tracked per-fundr,
-        the pool is shared across all products."""
+    def fund_pool(self, product_id: str) -> None:
+        """Anyone may add liquidity to a *specific* product's pool. The
+        received value is credited to that product's isolated
+        `pool_balance` ledger -- it can never be withdrawn except by that
+        product's creator and is reserved against that product's claims."""
+        product_id = str(product_id)
+        product = self.products.get(product_id)
+        if product is None:
+            raise gl.vm.UserError("unknown product_id")
         if gl.message.value <= 0:
             raise gl.vm.UserError("must send a positive amount to fund the pool")
+        product.pool_balance = product.pool_balance + gl.message.value
+        self.products[product_id] = product
 
     @gl.public.write
-    def withdraw_funds(self, amount: int) -> None:
-        """Only a product creator may withdraw from the pool. Withdrawal is
-        capped at the current balance so the pool can never go negative."""
+    def withdraw_funds(self, product_id: str, amount: int) -> None:
+        """Only the creator of a product may withdraw from *that* product's
+        pool. Withdrawal is capped at the product's current `pool_balance`
+        (which excludes funds already reserved by approved but un-settled
+        payouts), so the ledger can never go negative and no creator can
+        touch another product's funds."""
+        product_id = str(product_id)
         amount = int(amount)
         if amount <= 0:
             raise gl.vm.UserError("amount must be positive")
 
-        sender = gl.message.sender_address
-        authorized = any(
-            p.created_by == sender
-            for p in self.products.values()
-        )
-        if not authorized:
-            raise gl.vm.UserError("only a product creator can withdraw funds")
+        product = self.products.get(product_id)
+        if product is None:
+            raise gl.vm.UserError("unknown product_id")
+        if gl.message.sender_address != product.created_by:
+            raise gl.vm.UserError("only this product's creator can withdraw its funds")
 
-        if self.balance < u256(amount):
-            raise gl.vm.UserError("withdrawal exceeds the contract balance")
+        if product.pool_balance < u256(amount):
+            raise gl.vm.UserError("withdrawal exceeds this product's pool balance")
 
-        _EOA(sender).emit_transfer(value=u256(amount))
+        product.pool_balance = product.pool_balance - u256(amount)
+        self.products[product_id] = product
+
+        _EOA(gl.message.sender_address).emit_transfer(value=u256(amount))
 
     # -- Holder side -------------------------------------------------------
 
@@ -418,6 +445,11 @@ class ParametricInsurance(gl.Contract):
 
         policy_id = f"policy-{self.policy_count}"
         self.policy_count = self.policy_count + u256(1)
+
+        # The premium is revenue for this product's insurer: credit it to
+        # the product's own pool ledger, where only its creator can reach it.
+        product.pool_balance = product.pool_balance + product.premium
+        self.products[product_id] = product
 
         self.policies[policy_id] = Policy(
             product_id=product_id,
@@ -510,11 +542,17 @@ class ParametricInsurance(gl.Contract):
                 reason="below_threshold",
             )
 
-        if self.balance < coverage:
+        if product.pool_balance < coverage:
             raise gl.vm.UserError(
-                "insufficient contract funds to pay this claim -- "
+                "insufficient funds in this product's pool to pay this claim -- "
                 "the insurer must fund the pool first"
             )
+
+        # Reserve the liability now: deduct the coverage from the product's
+        # ledger in the same transaction that pays out, so the reserved
+        # amount can never be withdrawn before the transfer settles.
+        product.pool_balance = product.pool_balance - coverage
+        self.products[policy.product_id] = product
 
         holder = policy.holder
         _EOA(holder).emit_transfer(value=coverage)
@@ -603,6 +641,28 @@ class ParametricInsurance(gl.Contract):
 
     @gl.public.view
     def get_pool_balance(self) -> u256:
+        """Total liability ledger: the sum of every product's own
+        `pool_balance`. This is what is actually withdrawable / payable,
+        product by product (the sum stays <= the real contract balance)."""
+        total = u256(0)
+        for product in self.products.values():
+            total = total + product.pool_balance
+        return total
+
+    @gl.public.view
+    def get_product_pool_balance(self, product_id: str) -> u256:
+        """A single product's pool ledger (see `fund_pool` /
+        `withdraw_funds` / reserved payouts)."""
+        product_id = str(product_id)
+        product = self.products.get(product_id)
+        if product is None:
+            raise gl.vm.UserError("unknown product_id")
+        return product.pool_balance
+
+    @gl.public.view
+    def get_contract_balance(self) -> u256:
+        """The real GEN balance held on this contract. It always covers
+        (>=) the sum of all product pool ledgers."""
         return self.balance
 
 
