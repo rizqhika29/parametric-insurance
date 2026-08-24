@@ -44,13 +44,13 @@ Why this is more than "AI decides X"
    comparisons. There is no `float()` anywhere in the contract -- GenVM
    lint treats floats as non-deterministic, so the whole pipeline (LLM value
    parse, median, tolerance band, threshold crossing, payout) is integer math.
- 4. Defense against fraud / abuse. Only the holder of a policy can file a
+  4. Defense against fraud / abuse. Only the holder of a policy can file a
     claim on it; a policy can only be claimed once; claims can't be filed
-    against a suspended product; a claim is rejected (not paid) when the
-    sources can't reach consensus or when fewer than `MIN_DATA_SOURCES`
-    sources were reachable; the payout is reserved from the product's own
-    pool balance, so a creator can never drain funds earmarked for another
-    product's payouts.
+    with fewer than `MIN_DATA_SOURCES` sources reachable; the payout is
+    reserved from the product's own pool balance. Suspension blocks new
+    policies but preserves existing holders' claim rights, and a
+    creator's pool is locked by outstanding coverage liabilities so
+    funds earmarked for pending claims can never be withdrawn.
 5. Deterministic, unit-testable helpers. `_median`, `_parse_number`,
    `_tolerance_band`, `_within_tolerance`, `_extract_parameter` are plain
    integer-only Python that run before/after the consensus block and can
@@ -374,7 +374,8 @@ class ParametricInsurance(gl.Contract):
     @gl.public.write
     def suspend_product(self, product_id: str) -> None:
         """Only the product creator may suspend a product. Suspended
-        products can no longer have policies bought or claims filed."""
+        products can no longer have policies bought -- existing policy
+        holders retain their right to file claims regardless."""
         product_id = str(product_id)
         product = self.products.get(product_id)
         if product is None:
@@ -402,10 +403,10 @@ class ParametricInsurance(gl.Contract):
     @gl.public.write
     def withdraw_funds(self, product_id: str, amount: int) -> None:
         """Only the creator of a product may withdraw from *that* product's
-        pool. Withdrawal is capped at the product's current `pool_balance`
-        (which excludes funds already reserved by approved but un-settled
-        payouts), so the ledger can never go negative and no creator can
-        touch another product's funds."""
+        pool. Withdrawal is capped at the surplus above outstanding
+        liabilities: ``pool_balance - outstanding_coverage - amount >= 0``.
+        This ensures that a creator cannot withdraw funds earmarked for
+        policies whose claims have not yet been filed."""
         product_id = str(product_id)
         amount = int(amount)
         if amount <= 0:
@@ -417,8 +418,16 @@ class ParametricInsurance(gl.Contract):
         if gl.message.sender_address != product.created_by:
             raise gl.vm.UserError("only this product's creator can withdraw its funds")
 
-        if product.pool_balance < u256(amount):
-            raise gl.vm.UserError("withdrawal exceeds this product's pool balance")
+        outstanding = u256(0)
+        for policy in self.policies.values():
+            if policy.product_id == product_id and policy.status == POLICY_STATUS_ACTIVE:
+                outstanding = outstanding + policy.coverage
+
+        surplus = product.pool_balance - outstanding
+        if surplus < u256(amount):
+            raise gl.vm.UserError(
+                "insufficient surplus: outstanding coverage liabilities must be funded"
+            )
 
         product.pool_balance = product.pool_balance - u256(amount)
         self.products[product_id] = product
@@ -489,8 +498,6 @@ class ParametricInsurance(gl.Contract):
         product = self.products.get(policy.product_id)
         if product is None:
             raise gl.vm.UserError("unknown product for policy")
-        if product.status != PRODUCT_STATUS_ACTIVE:
-            raise gl.vm.UserError("product is suspended")
 
         event_context = event_context.strip()[:MAX_EVENT_CONTEXT_CHARS]
         if not event_context:
