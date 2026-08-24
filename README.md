@@ -12,7 +12,7 @@ An insurer deploys one or more `Product`s, holders buy `Policy`s by paying the e
 | Multi-source oracle consensus | A claim must be backed by data fetched from at least `MIN_DATA_SOURCES` (2) *independent* URLs configured on the product. The non-deterministic block only **acquires** each source (`gl.nondet.web.get`) and **extracts** a raw integer reading (`gl.nondet.exec_prompt`) — nothing else. `_consensus_validator` runs on every validator, which **independently re-acquires and re-extracts**, and only accepts the leader's readings if (a) it saw exactly the same set of reachable sources, (b) each source reading agrees within a **tolerance band**, and (c) the deterministic median of the leader's readings and its own lie on the **same side of the payout threshold**. |
 | Tolerance band + same-threshold-outcome guard | `tolerance_pct` is interpreted as a % of `threshold` (not of the measured values), so disagreement is measured in the units that matter for the payout decision — a 10% band on a 180-minute threshold means sources must agree within ±18 minutes. Because that band can in principle span the trigger, the validator *also* requires that the median implied by its own independent readings crosses the threshold in the **same direction** as the leader's. Reading on opposite sides of the threshold is always rejected, even when it would fit the band. |
 | Payout decision is deterministic and integer-only | The block only produces **raw per-source readings**. The median (`agreed_value`), the threshold crossing, and the payout amount are plain integer arithmetic computed *outside* the consensus block in `file_claim`. There is no `float()` anywhere — GenVM lint treats floats as a non-deterministic pattern, so the whole pipeline (LLM value parse, median, tolerance band, threshold decision, payout) is integer math. |
-| Fraud / abuse resistance | Only the policy holder can file a claim; a policy can be claimed at most once; claims are rejected (never paid) when sources can't reach consensus or when fewer than `MIN_DATA_SOURCES` sources are reachable; suspended products can't issue policies or pay claims; `withdraw_funds` is role-gated (only that product's creator) and capped at the product's own pool ledger. |
+| Fraud / abuse resistance | Only the policy holder can file a claim; a policy can be claimed at most once; claims are rejected (never paid) when sources can't reach consensus or when fewer than `MIN_DATA_SOURCES` sources are reachable; suspended products can't issue new policies but existing policy holders retain their claim rights; `withdraw_funds` is role-gated (only that product's creator), capped at the product's own pool ledger, and locked by outstanding coverage liabilities. |
 | Deterministic, unit-testable helpers | `_parse_number`, `_median`, `_tolerance_band`, `_within_tolerance`, `_strip_code_fence`, `_parse_json_object`, `_consensus_ok` are plain, integer-only Python tested in `tests/direct/test_helpers.py` with no VM. |
 
 ## State design
@@ -66,7 +66,7 @@ create_product (insurer) ──► product-0 [active]
       │
       └── fund_pool(product-0, value=...)  (anyone may add liquidity to a product's pool)
 
-file_claim(policy-0, event_context)      (holder only, once per policy)
+file_claim(policy-0, event_context)      (holder only, once per policy; works even on suspended products)
       │
       ├── consensus block (nondet, minimal): fetch each data_sources URL
       │     + extract a raw integer reading per source (leader + validators
@@ -79,17 +79,17 @@ file_claim(policy-0, event_context)      (holder only, once per policy)
              └─ reserve: product.pool_balance -= coverage; then
                 _EOA(holder).emit_transfer(holder, coverage) ──► policy [paid], claim [approved]  (settles at finalization)
 
-withdraw_funds(product-0, amount)  (only that product's creator; capped at its pool ledger)
-suspend_product(id)                (product creator only)
+withdraw_funds(product-0, amount)  (only that product's creator; capped at pool surplus above outstanding coverage liabilities)
+suspend_product(id)                (product creator only; blocks new policies but preserves existing claim rights)
 ```
 
 ## Public interface
 
 Insurer side:
 - `create_product(description, parameter_name, threshold, tolerance_pct, premium, coverage, data_sources) -> str` — caller becomes the product creator; returns `product_id`.
-- `suspend_product(product_id) -> None` — creator only; blocks new policies and claims.
+- `suspend_product(product_id) -> None` — creator only; blocks new policies. Existing policy holders retain their right to file claims.
 - `fund_pool(product_id) -> None` — payable; anyone may add liquidity to a *specific* product's isolated pool ledger.
-- `withdraw_funds(product_id, amount) -> None` — only that product's creator, capped at the product's pool ledger.
+- `withdraw_funds(product_id, amount) -> None` — only that product's creator, capped at the surplus above outstanding coverage liabilities (`pool_balance - outstanding_coverage >= amount`).
 
 Holder side:
 - `buy_policy(product_id) -> str` — payable; the transaction must carry exactly `premium`; returns `policy_id`. The premium is credited to the product's pool.
@@ -127,11 +127,11 @@ This is genuine multi-source consensus with a real equivalence check — not a t
 
 ## Deployed instance (GenLayer Studio)
 
-Latest clean deployment of `parametric_insurance.py` (corrected source: minimal non-deterministic block + same-threshold-outcome validator guard + per-product pool isolation with reserved liabilities, `# v0.3.0-rc7` runner version line). Verified with `genvm-lint check` (lint + SDK validation, exit 0), 63 direct tests, and the write-method integration suite (9 passed, ~14:30) against the deployed address below:
+Latest clean deployment of `parametric_insurance.py` (corrected source: minimal non-deterministic block + same-threshold-outcome validator guard + per-product pool isolation with reserved liabilities + claim rights preserved on suspended products + withdrawal locked by outstanding coverage liabilities, `# v0.3.0-rc7` runner version line). Verified with `genvm-lint check` (lint + SDK validation, exit 0), 64 direct tests, and the write-method integration suite against the deployed address below:
 
 | Network | Address | Explorer |
 |---|---|---|
-| Studio | `0x51015Be23FD90A6d5D274ff5243C315c4471e185` | [View on Explorer](https://explorer-studio.genlayer.com/address/0x51015Be23FD90A6d5D274ff5243C315c4471e185) |
+| Studio | `0x084485660Aad295d0b05055A98056a06228607A2` | [View on Explorer](https://explorer-studio.genlayer.com/address/0x084485660Aad295d0b05055A98056a06228607A2) |
 
 > The on-chain state after the integration suite confirms the accounting model: `get_pool_balance()` (sum of the isolated product ledgers) stays **≤** the real `get_contract_balance()`, with the difference equal to transfers that are reserved but not yet finalized (`emit_transfer` settles at finalization of the external message). Write transactions against Studio are rate-limited (30 req/min), so the integration suite throttles JSON-RPC calls and retries connection/rate-limit errors (see `tests/integration/conftest.py`).
 
@@ -139,7 +139,7 @@ Latest clean deployment of `parametric_insurance.py` (corrected source: minimal 
 
 - `tests/direct/test_helpers.py` — pure-Python unit tests of the deterministic helpers, loaded with a tiny `genlayer` stub (no Studio, no network): `pytest tests/direct/test_helpers.py`
 - `tests/direct/test_parametric_insurance.py` — direct-mode tests (no server) for the full lifecycle, money flow (premium → product pool → payout via a value-transfer hook), consensus behavior (agree / disagree / insufficient sources / threshold-straddle rejection, exercised with `direct_vm.run_validator()`), per-product pool isolation, reserved-liability accounting, and access control: `pytest tests/direct/test_parametric_insurance.py`
-- Security/edge cases (in the two files above, counted in the **63**): integer-parse edge cases (`.5`, `1e21`, `inf`, `-0`, giant ints), tolerance-band boundary inclusivity and negative-input clamping, source-set dedupe / min-max cap, `fund_pool`/`withdraw` zero-value and unknown-product reverts, garbage-extraction fail-safe (never pays), cross-creator pool isolation (`test_creator_cannot_withdraw_another_products_pool`), reserved-liability accounting (`test_approved_claim_reserves_funds_from_withdraw`), third-party funding attribution (`test_third_party_funding_attributed_to_product_creator`), the ledger-vs-real-balance accounting invariant (`test_ledger_sum_matches_contract_balance_invariant`), and the pinned insurer-dodge behavior (`test_suspend_product_blocks_payout_on_existing_policy`)
+- Security/edge cases (in the two files above, counted in the **64**): integer-parse edge cases (`.5`, `1e21`, `inf`, `-0`, giant ints), tolerance-band boundary inclusivity and negative-input clamping, source-set dedupe / min-max cap, `fund_pool`/`withdraw` zero-value and unknown-product reverts, garbage-extraction fail-safe (never pays), cross-creator pool isolation (`test_creator_cannot_withdraw_another_products_pool`), reserved-liability accounting (`test_approved_claim_reserves_funds_from_withdraw`), third-party funding attribution (`test_third_party_funding_attributed_to_product_creator`), the ledger-vs-real-balance accounting invariant (`test_ledger_sum_matches_contract_balance_invariant`), claim rights preserved on suspended products (`test_file_claim_allowed_on_suspended_product`, `test_suspend_product_allows_existing_policy_claims`), and withdrawal locked by outstanding coverage liabilities (`test_suspend_product_pools_locked_by_active_coverage`, `test_withdraw_funds_capped_by_active_liabilities`)
 - `tests/integration/test_probe_deployed.py` — read-only probe of the deployed contract (counts, balances) bound to `DEPLOYED_ADDRESS`.
 - `tests/integration/test_deployed_contract.py` — full write lifecycle against the deployed contract (create product → buy policy with exact premium → wrong-premium/unknown-product reverts → fund a product's pool → withdraw from it → suspend product → file claim & second-claim revert → create-product validation reverts): `pytest tests/integration/test_deployed_contract.py`. Ids derive from on-chain counters, so the suite is rerunnable against any fresh deployment by changing `DEPLOYED_ADDRESS`.
 
@@ -153,7 +153,6 @@ Test-runner notes (Windows, from the sibling contracts):
 - Coverage is a fixed per-policy amount; there is no scaling by `agreed_value` (e.g. no "payout = delay × rate"). That's a deliberate simplification — the fixed-amount design keeps the payout decision fully deterministic.
 - No claim-settlement period / adjudication contest: a claim is paid in the same transaction that reaches consensus. A composing contract could add a dispute window on top.
 - The model is a shared oracle: `event_context` is interpolated into the extraction prompt, so a holder's prompt-injection could steer all readings (validators use the same model, so multi-source only guarantees *consistency*, not *truth* of the sources).
-- **Insurer-dodge (pinned, by design):** only the creator can `suspend_product`, and a suspended product blocks claims on *already-sold* policies too. A malicious insurer could therefore suspend to avoid paying out (the holder keeps the policy but its claim reverts). The contract deliberately does not force a bad insurer to pay; honest creators use suspension only to stop new sales. Pinned by `test_suspend_product_blocks_payout_on_existing_policy`.
 - Funds sent to the contract outside a credited path (no existing `fund_pool(product_id)` / `buy_policy` / `create_product` flow) are not attributed to any product's ledger and are therefore not withdrawable.
 
 ## Design lesson: anchor the tolerance band to the trigger — and never let it straddle it
